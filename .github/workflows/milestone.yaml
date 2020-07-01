@@ -6,6 +6,7 @@ on:
 jobs:
   insist_milestone:
     name: Complain if a milestone isn't set
+    runs-on: ubuntu-latest
     # Don't need the expression syntax in the if
     # The if should stop the job from running
     if: github.event.pull_request.milestone == {}
