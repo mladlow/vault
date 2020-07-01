@@ -13,5 +13,11 @@ jobs:
     steps:
     - name: Dump some info
       env:
-        GITHUB_CONTEXT: ${{ toJson(github) }}
+        GITHUB_CONTEXT: ${{ toJson(github.event.pull_request) }}
       run: echo "$GITHUB_CONTEXT"
+    - name: Test conditional
+      if: github.event.pull_request.milestone == '{}'
+      run: echo "Hey, this needs a milestone!"
+    - name: Test other way
+      if: ${{ github.event.pull_request.milestone != '{}' }}
+      run: echo "This seems to have a milestone!"
