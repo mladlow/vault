@@ -16,8 +16,8 @@ jobs:
         GITHUB_CONTEXT: ${{ toJson(github.event.pull_request) }}
       run: echo "$GITHUB_CONTEXT"
     - name: Test conditional
-      if: github.event.pull_request.milestone == '{}'
+      if: github.event.pull_request.milestone == null
       run: echo "Hey, this needs a milestone!"
     - name: Test other way
-      if: ${{ github.event.pull_request.milestone != '{}' }}
+      if: github.event.pull_request.milestone != null
       run: echo "This seems to have a milestone!"
