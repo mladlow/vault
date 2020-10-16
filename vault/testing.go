@@ -156,6 +156,7 @@ func TestCoreWithSealAndUI(t testing.T, opts *CoreConfig) *Core {
 	conf.LicensingConfig = opts.LicensingConfig
 	conf.DisableKeyEncodingChecks = opts.DisableKeyEncodingChecks
 	conf.MetricsHelper = opts.MetricsHelper
+	conf.MetricSink = opts.MetricSink
 
 	if opts.Logger != nil {
 		conf.Logger = opts.Logger
@@ -304,6 +305,17 @@ func TestCoreUnsealed(t testing.T) (*Core, [][]byte, string) {
 	t.Helper()
 	core := TestCore(t)
 	return testCoreUnsealed(t, core)
+}
+
+func TestCoreUnsealedWithMetrics(t testing.T) (*Core, [][]byte, string, *metrics.InmemSink) {
+	t.Helper()
+	inmemSink := metrics.NewInmemSink(1000000*time.Hour, 2000000*time.Hour)
+	conf := &CoreConfig{
+		BuiltinRegistry: NewMockBuiltinRegistry(),
+		MetricSink:      metricsutil.NewClusterMetricSink("test-cluster", inmemSink),
+	}
+	core, keys, root := testCoreUnsealed(t, TestCoreWithSealAndUI(t, conf))
+	return core, keys, root, inmemSink
 }
 
 // TestCoreUnsealedRaw returns a pure in-memory core that is already
@@ -684,6 +696,19 @@ func TestWaitActive(t testing.T, core *Core) {
 	}
 }
 
+func TestWaitActiveForwardingReady(t testing.T, core *Core) {
+	TestWaitActive(t, core)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := core.getClusterListener().Handler(consts.RequestForwardingALPN); ok {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for request forwarding handler to be registered")
+}
+
 func TestWaitActiveWithError(core *Core) error {
 	start := time.Now()
 	var standby bool
@@ -871,26 +896,10 @@ func (c *TestClusterCore) stop() error {
 	return nil
 }
 
-func CleanupClusters(clusters []*TestCluster) {
-	wg := &sync.WaitGroup{}
-	for _, cluster := range clusters {
-		wg.Add(1)
-		lc := cluster
-		go func() {
-			defer wg.Done()
-			lc.Cleanup()
-		}()
-	}
-	wg.Wait()
-}
-
 func (c *TestCluster) Cleanup() {
 	c.Logger.Info("cleaning up vault cluster")
-	for _, core := range c.Cores {
-		// Upgrade logger to emit errors if not doing so already
-		if !core.CoreConfig.Logger.IsError() {
-			core.CoreConfig.Logger.SetLevel(log.Error)
-		}
+	if tl, ok := c.Logger.(*TestLogger); ok {
+		tl.StopLogging()
 	}
 
 	wg := &sync.WaitGroup{}
@@ -901,6 +910,8 @@ func (c *TestCluster) Cleanup() {
 		go func() {
 			defer wg.Done()
 			if err := lc.stop(); err != nil {
+				// Note that this log won't be seen if using TestLogger, due to
+				// the above call to StopLogging.
 				lc.Logger().Error("error during cleanup", "error", err)
 			}
 		}()
@@ -984,13 +995,13 @@ type TestClusterOptions struct {
 	DefaultHandlerProperties HandlerProperties
 
 	// BaseListenAddress is used to explicitly assign ports in sequence to the
-	// listener of each core.  It shoud be a string of the form
+	// listener of each core.  It should be a string of the form
 	// "127.0.0.1:20000"
 	//
 	// WARNING: Using an explicitly assigned port above 30000 may clash with
 	// ephemeral ports that have been assigned by the OS in other tests.  The
-	// use of explictly assigned ports below 30000 is strongly recommended.
-	// In addition, you should be careful to use explictly assigned ports that
+	// use of explicitly assigned ports below 30000 is strongly recommended.
+	// In addition, you should be careful to use explicitly assigned ports that
 	// do not clash with any other explicitly assigned ports in other tests.
 	BaseListenAddress string
 
@@ -1002,8 +1013,8 @@ type TestClusterOptions struct {
 	//
 	// WARNING: Using an explicitly assigned port above 30000 may clash with
 	// ephemeral ports that have been assigned by the OS in other tests.  The
-	// use of explictly assigned ports below 30000 is strongly recommended.
-	// In addition, you should be careful to use explictly assigned ports that
+	// use of explicitly assigned ports below 30000 is strongly recommended.
+	// In addition, you should be careful to use explicitly assigned ports that
 	// do not clash with any other explicitly assigned ports in other tests.
 	BaseClusterListenPort int
 
@@ -1053,32 +1064,50 @@ type TestLogger struct {
 	log.Logger
 	Path string
 	File *os.File
+	sink log.SinkAdapter
 }
 
 func NewTestLogger(t testing.T) *TestLogger {
+	var logFile *os.File
+	var logPath string
+	output := os.Stderr
+
 	var logDir = os.Getenv("VAULT_TEST_LOG_DIR")
-	if logDir == "" {
-		return &TestLogger{
-			Logger: logging.NewVaultLogger(log.Trace).Named(t.Name()),
+	if logDir != "" {
+		logPath = filepath.Join(logDir, t.Name()+".log")
+		// t.Name may include slashes.
+		dir, _ := filepath.Split(logPath)
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			t.Fatal(err)
 		}
+		logFile, err = os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		output = logFile
 	}
 
-	logFileName := filepath.Join(logDir, t.Name()+".log")
-	// t.Name may include slashes.
-	dir, _ := filepath.Split(logFileName)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	logFile, err := os.Create(logFileName)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	// We send nothing on the regular logger, that way we can later deregister
+	// the sink to stop logging during cluster cleanup.
+	logger := log.NewInterceptLogger(&log.LoggerOptions{
+		Output: ioutil.Discard,
+	})
+	sink := log.NewSinkAdapter(&log.LoggerOptions{
+		Output: output,
+		Level:  log.Trace,
+	})
+	logger.RegisterSink(sink)
 	return &TestLogger{
-		Path:   logFileName,
+		Path:   logPath,
 		File:   logFile,
-		Logger: logging.NewVaultLoggerWithWriter(logFile, log.Trace),
+		Logger: logger,
+		sink:   sink,
 	}
+}
+
+func (tl *TestLogger) StopLogging() {
+	tl.Logger.(log.InterceptLogger).DeregisterSink(tl.sink)
 }
 
 // NewTestCluster creates a new test cluster based on the provided core config
@@ -1380,7 +1409,10 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		coreConfig.LicensingConfig = base.LicensingConfig
 		coreConfig.DisablePerformanceStandby = base.DisablePerformanceStandby
 		coreConfig.MetricsHelper = base.MetricsHelper
+		coreConfig.MetricSink = base.MetricSink
 		coreConfig.SecureRandomReader = base.SecureRandomReader
+		coreConfig.DisableSentinelTrace = base.DisableSentinelTrace
+
 		if base.BuiltinRegistry != nil {
 			coreConfig.BuiltinRegistry = base.BuiltinRegistry
 		}
@@ -1432,6 +1464,13 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		coreConfig.DevToken = base.DevToken
 		coreConfig.CounterSyncInterval = base.CounterSyncInterval
 		coreConfig.RecoveryMode = base.RecoveryMode
+
+		testApplyEntBaseConfig(coreConfig, base)
+	}
+
+	if coreConfig.ClusterHeartbeatInterval == 0 {
+		// Set this lower so that state populates quickly to standby nodes
+		coreConfig.ClusterHeartbeatInterval = 2 * time.Second
 	}
 
 	if coreConfig.RawConfig == nil {
@@ -1517,7 +1556,7 @@ func NewTestCluster(t testing.T, base *CoreConfig, opts *TestClusterOptions) *Te
 		(*tcc.ReloadFuncs)["listener|tcp"] = []reloadutil.ReloadFunc{certGetters[i].Reload}
 		tcc.ReloadFuncsLock.Unlock()
 
-		testAdjustTestCore(base, tcc)
+		testAdjustUnderlyingStorage(tcc)
 
 		ret = append(ret, tcc)
 	}
@@ -1613,8 +1652,7 @@ func (cluster *TestCluster) StartCore(t testing.T, idx int, opts *TestClusterOpt
 	}
 
 	// Create a new Core
-	cleanup, newCore, localConfig, coreHandler := cluster.newCore(
-		t, idx, tcc.CoreConfig, opts, tcc.Listeners, cluster.pubKey)
+	cleanup, newCore, localConfig, coreHandler := cluster.newCore(t, idx, tcc.CoreConfig, opts, tcc.Listeners, cluster.pubKey)
 	if coreHandler != nil {
 		tcc.Handler = coreHandler
 		tcc.Server.Handler = coreHandler
@@ -1631,7 +1669,7 @@ func (cluster *TestCluster) StartCore(t testing.T, idx int, opts *TestClusterOpt
 
 	tcc.Client = cluster.getAPIClient(t, opts, tcc.Listeners[0].Address.Port, tcc.TLSConfig)
 
-	testAdjustTestCore(cluster.base, tcc)
+	testAdjustUnderlyingStorage(tcc)
 	testExtraTestCoreSetup(t, cluster.priKey, tcc)
 
 	// Start listeners
@@ -1643,11 +1681,7 @@ func (cluster *TestCluster) StartCore(t testing.T, idx int, opts *TestClusterOpt
 	tcc.Logger().Info("restarted test core", "core", idx)
 }
 
-func (testCluster *TestCluster) newCore(
-	t testing.T, idx int, coreConfig *CoreConfig,
-	opts *TestClusterOptions, listeners []*TestListener, pubKey interface{},
-) (func(), *Core, CoreConfig, http.Handler) {
-
+func (testCluster *TestCluster) newCore(t testing.T, idx int, coreConfig *CoreConfig, opts *TestClusterOptions, listeners []*TestListener, pubKey interface{}) (func(), *Core, CoreConfig, http.Handler) {
 	localConfig := *coreConfig
 	cleanupFunc := func() {}
 	var handler http.Handler
@@ -1992,7 +2026,7 @@ func (m *mockBuiltinRegistry) Get(name string, pluginType consts.PluginType) (fu
 	if name == "postgresql-database-plugin" {
 		return dbPostgres.New, true
 	}
-	return dbMysql.New(dbMysql.MetadataLen, dbMysql.MetadataLen, dbMysql.UsernameLen), true
+	return dbMysql.New(false), true
 }
 
 // Keys only supports getting a realistic list of the keys for database plugins.
@@ -2009,14 +2043,16 @@ func (m *mockBuiltinRegistry) Keys(pluginType consts.PluginType) []string {
 		"mysql-aurora-database-plugin",
 		"mysql-rds-database-plugin",
 		"mysql-legacy-database-plugin",
-		"postgresql-database-plugin",
-		"elasticsearch-database-plugin",
-		"mssql-database-plugin",
+
 		"cassandra-database-plugin",
-		"mongodb-database-plugin",
-		"mongodbatlas-database-plugin",
+		"couchbase-database-plugin",
+		"elasticsearch-database-plugin",
 		"hana-database-plugin",
 		"influxdb-database-plugin",
+		"mongodb-database-plugin",
+		"mongodbatlas-database-plugin",
+		"mssql-database-plugin",
+		"postgresql-database-plugin",
 		"redshift-database-plugin",
 	}
 }

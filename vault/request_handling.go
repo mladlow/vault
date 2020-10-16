@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	replTimeout = 10 * time.Second
+	replTimeout = 1 * time.Second
 )
 
 var (
@@ -582,6 +582,8 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
 	var nonHMACReqDataKeys []string
 	entry := c.router.MatchingMountEntry(ctx, req.Path)
 	if entry != nil {
+		// Set here so the audit log has it even if authorization fails
+		req.MountType = entry.Type
 		// Get and set ignored HMAC'd value.
 		if rawVals, ok := entry.synthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
 			nonHMACReqDataKeys = rawVals.([]string)
@@ -860,28 +862,16 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
 			leaseGenerated = true
 			resp.Secret.LeaseID = leaseID
 
-			// Get the actual time of the lease
-			le, err := c.expiration.FetchLeaseTimes(ctx, leaseID)
-			if err != nil {
-				c.logger.Error("failed to fetch updated lease time", "request_path", req.Path, "error", err)
-				retErr = multierror.Append(retErr, ErrInternalError)
-				return nil, auth, retErr
-			}
-			// We round here because the clock will have already started
-			// ticking, so we'll end up always returning 299 instead of 300 or
-			// 26399 instead of 26400, say, even if it's just a few
-			// microseconds. This provides a nicer UX.
-			resp.Secret.TTL = le.ExpireTime.Sub(time.Now()).Round(time.Second)
-
 			// Count the lease creation
 			ttl_label := metricsutil.TTLBucket(resp.Secret.TTL)
+			mountPointWithoutNs := ns.TrimmedPath(req.MountPoint)
 			c.MetricSink().IncrCounterWithLabels(
 				[]string{"secret", "lease", "creation"},
 				1,
 				[]metrics.Label{
 					metricsutil.NamespaceLabel(ns),
 					{"secret_engine", req.MountType},
-					{"mount_point", req.MountPoint},
+					{"mount_point", mountPointWithoutNs},
 					{"creation_ttl", ttl_label},
 				},
 			)
@@ -987,6 +977,8 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 	var nonHMACReqDataKeys []string
 	entry := c.router.MatchingMountEntry(ctx, req.Path)
 	if entry != nil {
+		// Set here so the audit log has it even if authorization fails
+		req.MountType = entry.Type
 		// Get and set ignored HMAC'd value.
 		if rawVals, ok := entry.synthesizedConfigCache.Load("audit_non_hmac_request_keys"); ok {
 			nonHMACReqDataKeys = rawVals.([]string)
@@ -1268,13 +1260,15 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 
 		// Count the successful token creation
 		ttl_label := metricsutil.TTLBucket(tokenTTL)
+		// Do not include namespace path in mount point; already present as separate label.
+		mountPointWithoutNs := ns.TrimmedPath(req.MountPoint)
 		c.metricSink.IncrCounterWithLabels(
 			[]string{"token", "creation"},
 			1,
 			[]metrics.Label{
 				metricsutil.NamespaceLabel(ns),
 				{"auth_method", req.MountType},
-				{"mount_point", req.MountPoint},
+				{"mount_point", mountPointWithoutNs},
 				{"creation_ttl", ttl_label},
 				{"token_type", auth.TokenType.String()},
 			},

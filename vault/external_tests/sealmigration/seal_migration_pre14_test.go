@@ -23,14 +23,13 @@ import (
 // migration, using the pre-1.4 method of bring down the whole cluster to do
 // the migration.
 func TestSealMigration_TransitToShamir_Pre14(t *testing.T) {
+	t.Parallel()
 	// Note that we do not test integrated raft storage since this is
 	// a pre-1.4 test.
 	testVariousBackends(t, testSealMigrationTransitToShamir_Pre14, basePort_TransitToShamir_Pre14, false)
 }
 
-func testSealMigrationTransitToShamir_Pre14(
-	t *testing.T, logger hclog.Logger,
-	storage teststorage.ReusableStorage, basePort int) {
+func testSealMigrationTransitToShamir_Pre14(t *testing.T, logger hclog.Logger, storage teststorage.ReusableStorage, basePort int) {
 
 	// Create the transit server.
 	tss := sealhelper.NewTransitSealServer(t)
@@ -45,8 +44,8 @@ func testSealMigrationTransitToShamir_Pre14(
 	cluster, _, transitSeal := initializeTransit(t, logger, storage, basePort, tss)
 	rootToken, recoveryKeys := cluster.RootToken, cluster.RecoveryKeys
 	cluster.EnsureCoresSealed(t)
-	storage.Cleanup(t, cluster)
 	cluster.Cleanup()
+	storage.Cleanup(t, cluster)
 
 	// Migrate the backend from transit to shamir
 	migrateFromTransitToShamir_Pre14(t, logger, storage, basePort, tss, transitSeal, rootToken, recoveryKeys)
@@ -61,12 +60,7 @@ func testSealMigrationTransitToShamir_Pre14(
 	runShamir(t, logger, storage, basePort, rootToken, recoveryKeys)
 }
 
-func migrateFromTransitToShamir_Pre14(
-	t *testing.T, logger hclog.Logger,
-	storage teststorage.ReusableStorage, basePort int,
-	tss *sealhelper.TransitSealServer, transitSeal vault.Seal,
-	rootToken string, recoveryKeys [][]byte) {
-
+func migrateFromTransitToShamir_Pre14(t *testing.T, logger hclog.Logger, storage teststorage.ReusableStorage, basePort int, tss *sealhelper.TransitSealServer, transitSeal vault.Seal, rootToken string, recoveryKeys [][]byte) {
 	var baseClusterPort = basePort + 10
 
 	var conf = vault.CoreConfig{
@@ -90,8 +84,8 @@ func migrateFromTransitToShamir_Pre14(
 	cluster := vault.NewTestCluster(t, &conf, &opts)
 	cluster.Start()
 	defer func() {
-		storage.Cleanup(t, cluster)
 		cluster.Cleanup()
+		storage.Cleanup(t, cluster)
 	}()
 
 	leader := cluster.Cores[0]
@@ -116,12 +110,20 @@ func migrateFromTransitToShamir_Pre14(
 	time.Sleep(10 * time.Second)
 
 	// Read the secret
-	secret, err := client.Logical().Read("secret/foo")
+	secret, err := client.Logical().Read("kv-wrapped/foo")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if diff := deep.Equal(secret.Data, map[string]interface{}{"zork": "quux"}); len(diff) > 0 {
 		t.Fatal(diff)
+	}
+
+	// Write a new secret
+	_, err = leader.Client.Logical().Write("kv-wrapped/test", map[string]interface{}{
+		"zork": "quux",
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Make sure the seal configs were updated correctly.

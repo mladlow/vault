@@ -40,6 +40,7 @@ import (
 )
 
 const maxBytes = 128 * 1024
+const globalScope = "global"
 
 func systemBackendMemDBSchema() *memdb.DBSchema {
 	systemSchema := &memdb.DBSchema{
@@ -99,6 +100,7 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 				"leases/revoke-prefix/*",
 				"leases/revoke-force/*",
 				"leases/lookup/*",
+				"storage/raft/snapshot-auto/config/*",
 			},
 
 			Unauthenticated: []string{
@@ -112,6 +114,8 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 				"replication/performance/status",
 				"replication/dr/status",
 				"replication/dr/secondary/promote",
+				"replication/dr/secondary/disable",
+				"replication/dr/secondary/recover",
 				"replication/dr/secondary/update-primary",
 				"replication/dr/secondary/operation-token/delete",
 				"replication/dr/secondary/license",
@@ -168,6 +172,13 @@ func NewSystemBackend(core *Core, logger log.Logger) *SystemBackend {
 
 	if backend := core.getRaftBackend(); backend != nil {
 		b.Backend.Paths = append(b.Backend.Paths, b.raftStoragePaths()...)
+	}
+
+	// If the node is in a DR secondary cluster, we need to allow the ability to
+	// remove a Raft peer without being authenticated by instead providing a DR
+	// operation token.
+	if core.IsDRSecondary() {
+		b.Backend.PathsSpecial.Unauthenticated = append(b.Backend.PathsSpecial.Unauthenticated, "storage/raft/remove-peer")
 	}
 
 	b.Backend.Invalidate = sysInvalidate(b)
@@ -434,6 +445,11 @@ func (b *SystemBackend) handlePluginCatalogDelete(ctx context.Context, req *logi
 func (b *SystemBackend) handlePluginReloadUpdate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	pluginName := d.Get("plugin").(string)
 	pluginMounts := d.Get("mounts").([]string)
+	scope := d.Get("scope").(string)
+
+	if scope != "" && scope != globalScope {
+		return logical.ErrorResponse("reload scope must be omitted or 'global'"), nil
+	}
 
 	if pluginName != "" && len(pluginMounts) > 0 {
 		return logical.ErrorResponse("plugin and mounts cannot be set at the same time"), nil
@@ -454,7 +470,20 @@ func (b *SystemBackend) handlePluginReloadUpdate(ctx context.Context, req *logic
 		}
 	}
 
-	return nil, nil
+	r := logical.Response{
+		Data: map[string]interface{}{
+			"reload_id": req.ID,
+		},
+	}
+
+	if scope == globalScope {
+		err := handleGlobalPluginReload(ctx, b.Core, req.ID, pluginName, pluginMounts)
+		if err != nil {
+			return nil, err
+		}
+		return logical.RespondWithStatusCode(&r, req, http.StatusAccepted)
+	}
+	return &r, nil
 }
 
 // handleAuditedHeaderUpdate creates or overwrites a header entry
@@ -3222,7 +3251,8 @@ func (b *SystemBackend) pathInternalUIMountsRead(ctx context.Context, req *logic
 
 	b.Core.mountsLock.RLock()
 	for _, entry := range b.Core.mounts.Entries {
-		filtered, err := b.Core.checkReplicatedFiltering(ctx, entry, "")
+		ctxWithNamespace := namespace.ContextWithNamespace(ctx, entry.Namespace())
+		filtered, err := b.Core.checkReplicatedFiltering(ctxWithNamespace, entry, "")
 		if err != nil {
 			b.Core.mountsLock.RUnlock()
 			return nil, err
@@ -3248,7 +3278,8 @@ func (b *SystemBackend) pathInternalUIMountsRead(ctx context.Context, req *logic
 
 	b.Core.authLock.RLock()
 	for _, entry := range b.Core.auth.Entries {
-		filtered, err := b.Core.checkReplicatedFiltering(ctx, entry, credentialRoutePrefix)
+		ctxWithNamespace := namespace.ContextWithNamespace(ctx, entry.Namespace())
+		filtered, err := b.Core.checkReplicatedFiltering(ctxWithNamespace, entry, credentialRoutePrefix)
 		if err != nil {
 			b.Core.authLock.RUnlock()
 			return nil, err

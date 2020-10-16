@@ -9,6 +9,7 @@ import (
 func testGenerateCoreKeys() (interface{}, interface{}, error)         { return nil, nil, nil }
 func testGetLicensingConfig(interface{}) *LicensingConfig             { return &LicensingConfig{} }
 func testExtraTestCoreSetup(testing.T, interface{}, *TestClusterCore) {}
-func testAdjustTestCore(_ *CoreConfig, tcc *TestClusterCore) {
+func testAdjustUnderlyingStorage(tcc *TestClusterCore) {
 	tcc.UnderlyingStorage = tcc.physical
 }
+func testApplyEntBaseConfig(coreConfig, base *CoreConfig) {}

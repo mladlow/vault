@@ -12,6 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	metrics "github.com/armon/go-metrics"
+	"github.com/hashicorp/errwrap"
+	log "github.com/hashicorp/go-hclog"
+	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/base62"
 	"github.com/hashicorp/vault/sdk/helper/consts"
@@ -19,11 +24,6 @@ import (
 	"github.com/hashicorp/vault/sdk/helper/locksutil"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/vault/quotas"
-	metrics "github.com/armon/go-metrics"
-	"github.com/hashicorp/errwrap"
-	log "github.com/hashicorp/go-hclog"
-	multierror "github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/vault/helper/namespace"
 	uberAtomic "go.uber.org/atomic"
 )
 
@@ -291,25 +291,24 @@ func (m *ExpirationManager) invalidate(key string) {
 				m.pending.Delete(leaseID)
 				m.leaseCount--
 
-				// If in the nonexpiring map, remove there.
-				m.nonexpiring.Delete(leaseID)
-
 				if err := m.core.quotasHandleLeases(ctx, quotas.LeaseActionDeleted, []string{leaseID}); err != nil {
-					m.logger.Error("failed to handle lease delete invalidation", "error", err)
+					m.logger.Error("failed to update quota on lease invalidation", "error", err)
 					return
 				}
 			default:
 				// Handle lease update
-				m.updatePendingInternal(le, le.ExpireTime.Sub(time.Now()))
+				m.updatePendingInternal(le)
 			}
 		default:
 			// There is no entry in the pending map and the invalidation
-			// resulted in a nil entry. This should ideally never happen.
+			// resulted in a nil entry.
 			if le == nil {
+				// If in the nonexpiring map, remove there.
+				m.nonexpiring.Delete(leaseID)
 				return
 			}
 			// Handle lease creation
-			m.updatePendingInternal(le, le.ExpireTime.Sub(time.Now()))
+			m.updatePendingInternal(le)
 		}
 	}
 }
@@ -626,9 +625,9 @@ func (m *ExpirationManager) Stop() error {
 		info := value.(pendingInfo)
 		info.timer.Stop()
 		m.pending.Delete(key)
-		m.leaseCount--
 		return true
 	})
+	m.leaseCount = 0
 	m.nonexpiring.Range(func(key, value interface{}) bool {
 		m.nonexpiring.Delete(key)
 		return true
@@ -682,7 +681,7 @@ func (m *ExpirationManager) LazyRevoke(ctx context.Context, leaseID string) erro
 			return err
 		}
 
-		m.updatePendingInternal(le, 0)
+		m.updatePendingInternal(le)
 		m.pendingLock.Unlock()
 	}
 
@@ -737,10 +736,9 @@ func (m *ExpirationManager) revokeCommon(ctx context.Context, leaseID string, fo
 		pending.timer.Stop()
 		m.pending.Delete(leaseID)
 		m.leaseCount--
+		// Log but do not fail; unit tests (and maybe Tidy on production systems)
 		if err := m.core.quotasHandleLeases(ctx, quotas.LeaseActionDeleted, []string{leaseID}); err != nil {
-			m.pendingLock.Unlock()
-			m.logger.Error("failed to handle lease path deletion", "error", err)
-			return err
+			m.logger.Error("failed to update quota on revocation", "error", err)
 		}
 	}
 	m.nonexpiring.Delete(leaseID)
@@ -812,7 +810,7 @@ func (m *ExpirationManager) RevokeByToken(ctx context.Context, te *logical.Token
 					return err
 				}
 
-				m.updatePendingInternal(le, 0)
+				m.updatePendingInternal(le)
 				m.pendingLock.Unlock()
 			}
 		}
@@ -982,6 +980,11 @@ func (m *ExpirationManager) Renew(ctx context.Context, leaseID string, increment
 		if err != nil {
 			return nil, err
 		}
+
+		if tokenLeaseTimes == nil {
+			return nil, errors.New("failed to load batch token expiration time")
+		}
+
 		if le.ExpireTime.After(tokenLeaseTimes.ExpireTime) {
 			resp.Secret.TTL = tokenLeaseTimes.ExpireTime.Sub(le.LastRenewalTime)
 			le.ExpireTime = tokenLeaseTimes.ExpireTime
@@ -996,7 +999,7 @@ func (m *ExpirationManager) Renew(ctx context.Context, leaseID string, increment
 		}
 
 		// Update the expiration time
-		m.updatePendingInternal(le, resp.Secret.LeaseTotal())
+		m.updatePendingInternal(le)
 		m.pendingLock.Unlock()
 	}
 
@@ -1111,7 +1114,7 @@ func (m *ExpirationManager) RenewToken(ctx context.Context, req *logical.Request
 		}
 
 		// Update the expiration time
-		m.updatePendingInternal(le, resp.Auth.LeaseTotal())
+		m.updatePendingInternal(le)
 		m.pendingLock.Unlock()
 	}
 
@@ -1201,6 +1204,9 @@ func (m *ExpirationManager) Register(ctx context.Context, req *logical.Request, 
 		if err != nil {
 			return "", err
 		}
+		if tokenLeaseTimes == nil {
+			return "", errors.New("failed to load batch token expiration time")
+		}
 		if le.ExpireTime.After(tokenLeaseTimes.ExpireTime) {
 			le.ExpireTime = tokenLeaseTimes.ExpireTime
 		}
@@ -1226,7 +1232,13 @@ func (m *ExpirationManager) Register(ctx context.Context, req *logical.Request, 
 	}
 
 	// Setup revocation timer if there is a lease
-	m.updatePending(le, resp.Secret.LeaseTotal())
+	m.updatePending(le)
+
+	// We round here because the clock will have already started
+	// ticking, so we'll end up always returning 299 instead of 300 or
+	// 26399 instead of 26400, say, even if it's just a few
+	// microseconds. This provides a nicer UX.
+	resp.Secret.TTL = le.ExpireTime.Sub(time.Now()).Round(time.Second)
 
 	// Done
 	return le.LeaseID, nil
@@ -1299,7 +1311,7 @@ func (m *ExpirationManager) RegisterAuth(ctx context.Context, te *logical.TokenE
 	}
 
 	// Setup revocation timer
-	m.updatePending(&le, auth.LeaseTotal())
+	m.updatePending(&le)
 
 	return nil
 }
@@ -1432,16 +1444,16 @@ func (m *ExpirationManager) uniquePoliciesGc() {
 }
 
 // updatePending is used to update a pending invocation for a lease
-func (m *ExpirationManager) updatePending(le *leaseEntry, leaseTotal time.Duration) {
+func (m *ExpirationManager) updatePending(le *leaseEntry) {
 	m.pendingLock.Lock()
 	defer m.pendingLock.Unlock()
 
-	m.updatePendingInternal(le, leaseTotal)
+	m.updatePendingInternal(le)
 }
 
 // updatePendingInternal is the locked version of updatePending; do not call
 // this without a write lock on m.pending
-func (m *ExpirationManager) updatePendingInternal(le *leaseEntry, leaseTotal time.Duration) {
+func (m *ExpirationManager) updatePendingInternal(le *leaseEntry) {
 	var pending pendingInfo
 
 	// Check for an existing timer
@@ -1464,13 +1476,14 @@ func (m *ExpirationManager) updatePendingInternal(le *leaseEntry, leaseTotal tim
 			m.pending.Delete(le.LeaseID)
 			m.leaseCount--
 			if err := m.core.quotasHandleLeases(m.quitContext, quotas.LeaseActionDeleted, []string{le.LeaseID}); err != nil {
-				m.logger.Error("failed to handle lease path deletion", "error", err)
+				m.logger.Error("failed to update quota on lease deletion", "error", err)
 				return
 			}
 		}
 		return
 	}
 
+	leaseTotal := le.ExpireTime.Sub(time.Now())
 	leaseCreated := false
 	// Create entry if it does not exist or reset if it does
 	if ok {
@@ -1497,7 +1510,7 @@ func (m *ExpirationManager) updatePendingInternal(le *leaseEntry, leaseTotal tim
 
 	if leaseCreated {
 		if err := m.core.quotasHandleLeases(m.quitContext, quotas.LeaseActionCreated, []string{le.LeaseID}); err != nil {
-			m.logger.Error("failed to handle lease creation", "error", err)
+			m.logger.Error("failed to update quota on lease creation", "error", err)
 			return
 		}
 	}
@@ -1650,7 +1663,7 @@ func (m *ExpirationManager) loadEntryInternal(ctx context.Context, leaseID strin
 		m.restoreLoaded.Store(le.LeaseID, struct{}{})
 
 		// Setup revocation timer
-		m.updatePending(le, le.ExpireTime.Sub(time.Now()))
+		m.updatePending(le)
 	}
 	return le, nil
 }

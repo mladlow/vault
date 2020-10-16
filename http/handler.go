@@ -221,29 +221,40 @@ func (w *copyResponseWriter) WriteHeader(code int) {
 
 func handleAuditNonLogical(core *vault.Core, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		input := &logical.LogInput{
-			Request: w.(*LogicalResponseWriter).request,
+		origBody := new(bytes.Buffer)
+		reader := ioutil.NopCloser(io.TeeReader(r.Body, origBody))
+		r.Body = reader
+		req, _, status, err := buildLogicalRequestNoAuth(core.PerfStandby(), w, r)
+		if err != nil || status != 0 {
+			respondError(w, status, err)
+			return
 		}
-		core.AuditLogger().AuditRequest(r.Context(), input)
+		if origBody != nil {
+			r.Body = ioutil.NopCloser(origBody)
+		}
+		input := &logical.LogInput{
+			Request: req,
+		}
+		err = core.AuditLogger().AuditRequest(r.Context(), input)
+		if err != nil {
+			respondError(w, status, err)
+			return
+		}
 		cw := newCopyResponseWriter(w)
 		h.ServeHTTP(cw, r)
 		data := make(map[string]interface{})
-		err := jsonutil.DecodeJSON(cw.body.Bytes(), &data)
+		err = jsonutil.DecodeJSON(cw.body.Bytes(), &data)
 		if err != nil {
 			// best effort, ignore
 		}
 		httpResp := &logical.HTTPResponse{Data: data, Headers: cw.Header()}
 		input.Response = logical.HTTPResponseToLogicalResponse(httpResp)
-		core.AuditLogger().AuditResponse(r.Context(), input)
+		err = core.AuditLogger().AuditResponse(r.Context(), input)
+		if err != nil {
+			respondError(w, status, err)
+		}
 		return
 	})
-}
-
-// LogicalResponseWriter is used to carry the logical request from generic
-// handler down to all the middleware http handlers.
-type LogicalResponseWriter struct {
-	http.ResponseWriter
-	request *logical.Request
 }
 
 // wrapGenericHandler wraps the handler with an extra layer of handler where
@@ -301,26 +312,7 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 			return
 		}
 
-		origBody := new(bytes.Buffer)
-		reader := ioutil.NopCloser(io.TeeReader(r.Body, origBody))
-		r.Body = reader
-		req, _, status, err := buildLogicalRequestNoAuth(core.PerfStandby(), w, r)
-		if err != nil || status != 0 {
-			respondError(w, status, err)
-			return
-		}
-		// Reset the body since logical request creation already read the
-		// request body.
-		r.Body = ioutil.NopCloser(origBody)
-
-		// Set the mount path in the request
-		req.MountPoint = core.MatchingMount(r.Context(), req.Path)
-
-		// Pass the logical request down through the response writer
-		h.ServeHTTP(&LogicalResponseWriter{
-			ResponseWriter: w,
-			request:        req,
-		}, r)
+		h.ServeHTTP(w, r)
 
 		cancelFunc()
 		return
